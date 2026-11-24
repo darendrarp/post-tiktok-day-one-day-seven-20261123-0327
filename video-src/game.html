@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>STARFALL — a tiny agent-built game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  canvas { display: block; width: 1080px; height: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+'use strict';
+/*
+ * STARFALL — a tiny vertical arcade dodger, built by my AI agent in one
+ * session for the make.fun "Day one, day seven" TikTok bounty.
+ *
+ * One deterministic simulation, two presentations:
+ *   ?v=day1 — the bare first build (black, white, no HUD, no effects).
+ *   ?v=day7 — the same game after a week of daily updates: same map, same
+ *             start, same ship path — visibly more going on around it.
+ *
+ * The ship's path is IDENTICAL in both versions by construction: the sim
+ * (spawns, autopilot, collisions) runs on its own RNG stream and never
+ * reads anything the presentation layers do. Day 7 only ADDS rendering:
+ * gradient sky, parallax starfield, glow, particles, drones, HUD, shake.
+ * Same seed, same second of footage => the same game moment, twice.
+ */
+const W = 1080, H = 1920;
+const SHIP_Y = 1650;
+const params = new URLSearchParams(location.search);
+const VERSION = params.get('v') === 'day7' ? 'day7' : 'day1';
+const DAY7 = VERSION === 'day7';
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const simRng = mulberry32(1337); // spawns + autopilot: NEVER touched by rendering
+const fxRng = mulberry32(777);   // visuals only: particles, drones, starfield
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+// ---- shared simulation state (identical in both versions) ----
+const ship = { x: 540, target: 540, speed: 520 };
+const stars = [];   // {x, y, vy, r}
+const rocks = [];   // {x, y, vy, s, rot, vr}
+let simT = 0;
+let starTimer = 0, rockTimer = 0.6;
+let score = 0, combo = 0, collected = 0, missed = 0;
+// Events the presentation layer may read (never written back into the sim).
+const events = [];  // {type:'collect'|'miss', x, y, t}
+
+function stepSim(dt) {
+  simT += dt;
+  // Spawns (fixed schedule, seeded positions).
+  starTimer -= dt;
+  if (starTimer <= 0) {
+    starTimer += 0.45;
+    stars.push({ x: 80 + simRng() * 920, y: -30, vy: 260 + simRng() * 120, r: 10 });
+  }
+  rockTimer -= dt;
+  if (rockTimer <= 0) {
+    rockTimer += 1.1;
+    rocks.push({ x: 60 + simRng() * 960, y: -40, vy: 300 + simRng() * 140,
+                 s: 34 + simRng() * 24, rot: simRng() * Math.PI, vr: (simRng() - 0.5) * 2 });
+  }
+  // Autopilot: chase the nearest star below y=1500; dodge close rocks.
+  let target = ship.target;
+  let best = null, bestD = 1e9;
+  for (const s of stars) {
+    if (s.y < 1500) { const d = Math.abs(s.x - ship.x) + (1500 - s.y) * 0.4; if (d < bestD) { bestD = d; best = s; } }
+  }
+  if (best) target = best.x;
+  for (const r of rocks) {
+    const dy = SHIP_Y - r.y;
+    if (dy > 0 && dy < 420 && Math.abs(r.x - ship.x) < 110) {
+      target = ship.x + (r.x < ship.x ? 240 : -240);
+      break;
+    }
+  }
+  ship.target = Math.max(50, Math.min(W - 50, target));
+  const dx = ship.target - ship.x;
+  const mv = ship.speed * dt;
+  ship.x += Math.abs(dx) <= mv ? dx : Math.sign(dx) * mv;
+  // Move + collect + miss.
+  for (let i = stars.length - 1; i >= 0; i--) {
+    const s = stars[i];
+    s.y += s.vy * dt;
+    if (Math.abs(s.x - ship.x) < 50 && s.y > SHIP_Y - 55 && s.y < SHIP_Y + 55) {
+      stars.splice(i, 1);
+      score += 10; combo++; collected++;
+      events.push({ type: 'collect', x: s.x, y: s.y, t: simT });
+    } else if (s.y > H + 30) {
+      stars.splice(i, 1);
+      combo = 0; missed++;
+      events.push({ type: 'miss', x: s.x, y: H - 10, t: simT });
+    }
+  }
+  for (let i = rocks.length - 1; i >= 0; i--) {
+    const r = rocks[i];
+    r.y += r.vy * dt; r.rot += r.vr * dt;
+    if (r.y > H + 60) rocks.splice(i, 1);
+  }
+}
+
+// ---- day-7 presentation state (visual only) ----
+const bgStars = [];
+for (let i = 0; i < 110; i++) {
+  bgStars.push({ x: fxRng() * W, y: fxRng() * H, r: 0.6 + fxRng() * 1.8,
+                 layer: 1 + Math.floor(fxRng() * 3), tw: fxRng() * Math.PI * 2 });
+}
+const speedLines = [];
+for (let i = 0; i < 14; i++) {
+  speedLines.push({ x: fxRng() * W, y: fxRng() * H, len: 60 + fxRng() * 120, v: 500 + fxRng() * 300 });
+}
+const particles = [];  // {x,y,vx,vy,life,maxLife}
+const floaters = [];   // {x,y,text,life}
+const drones = [];     // {x,y,vx,blink}
+let droneTimer = 2.2, shake = 0, eventIdx = 0;
+const trail = [];
+
+function spawnBurst(x, y) {
+  for (let i = 0; i < 14; i++) {
+    const a = fxRng() * Math.PI * 2, sp = 90 + fxRng() * 260;
+    particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60,
+                     life: 0.5 + fxRng() * 0.4, maxLife: 0.9 });
+  }
+  floaters.push({ x, y: y - 24, text: '+10', life: 0.9 });
+}
+
+function drawShipDay1() {
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(ship.x, SHIP_Y - 34);
+  ctx.lineTo(ship.x - 26, SHIP_Y + 26);
+  ctx.lineTo(ship.x + 26, SHIP_Y + 26);
+  ctx.closePath(); ctx.stroke();
+}
+
+function drawShipDay7(dt) {
+  trail.push({ x: ship.x, y: SHIP_Y + 30 });
+  if (trail.length > 14) trail.shift();
+  for (let i = 0; i < trail.length; i++) {
+    const p = trail[i], a = (i / trail.length) * 0.25;
+    ctx.fillStyle = `rgba(0,229,255,${a})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y + (trail.length - i) * 2.2, 10 + i * 0.7, 0, Math.PI * 2); ctx.fill();
+  }
+  // Engine flame (flicker).
+  const fl = 30 + fxRng() * 26;
+  const grad = ctx.createLinearGradient(0, SHIP_Y + 26, 0, SHIP_Y + 26 + fl);
+  grad.addColorStop(0, 'rgba(255,214,64,0.95)');
+  grad.addColorStop(1, 'rgba(255,80,40,0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(ship.x - 12, SHIP_Y + 24);
+  ctx.lineTo(ship.x + 12, SHIP_Y + 24);
+  ctx.lineTo(ship.x, SHIP_Y + 26 + fl);
+  ctx.closePath(); ctx.fill();
+  // Hull: cyan-to-magenta gradient triangle with glow.
+  ctx.save();
+  ctx.shadowColor = '#00e5ff'; ctx.shadowBlur = 22;
+  const hg = ctx.createLinearGradient(ship.x, SHIP_Y - 36, ship.x, SHIP_Y + 28);
+  hg.addColorStop(0, '#7df9ff'); hg.addColorStop(0.55, '#00b3ff'); hg.addColorStop(1, '#ff4fd8');
+  ctx.fillStyle = hg;
+  ctx.beginPath();
+  ctx.moveTo(ship.x, SHIP_Y - 36);
+  ctx.lineTo(ship.x - 30, SHIP_Y + 28);
+  ctx.lineTo(ship.x, SHIP_Y + 12);
+  ctx.lineTo(ship.x + 30, SHIP_Y + 28);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+  // Shield ring (visual power-up, 2.5 s windows starting at t=6 s and t=14 s).
+  const inShield = (simT > 6 && simT < 8.5) || (simT > 14 && simT < 16.5);
+  if (inShield) {
+    ctx.strokeStyle = 'rgba(0,255,200,0.75)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(ship.x, SHIP_Y, 62 + Math.sin(simT * 6) * 3, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+
+function renderDay1() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  // Sparse static dots (precomputed, dim).
+  ctx.fillStyle = '#333';
+  for (const s of bgStars) { if (s.layer === 1) ctx.fillRect(s.x, s.y, 2, 2); }
+  // Stars: plain white circles.
+  ctx.fillStyle = '#fff';
+  for (const s of stars) { ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill(); }
+  // Rocks: plain gray squares.
+  ctx.fillStyle = '#888';
+  for (const r of rocks) {
+    ctx.save(); ctx.translate(r.x, r.y); ctx.rotate(r.rot);
+    ctx.fillRect(-r.s / 2, -r.s / 2, r.s, r.s); ctx.restore();
+  }
+  drawShipDay1();
+}
+
+function renderDay7(dt) {
+  // Deep-space gradient.
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#04020f'); g.addColorStop(0.5, '#0a1030'); g.addColorStop(1, '#160a33');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // Parallax starfield (3 layers drift down at different speeds).
+  for (const s of bgStars) {
+    s.y += (18 + s.layer * 34) * dt;
+    if (s.y > H) { s.y = -4; s.x = fxRng() * W; }
+    const a = 0.35 + 0.3 * Math.sin(simT * 2 + s.tw) + s.layer * 0.12;
+    ctx.fillStyle = `rgba(255,255,255,${Math.max(0.1, Math.min(0.9, a))})`;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  // Speed lines.
+  ctx.strokeStyle = 'rgba(140,220,255,0.10)'; ctx.lineWidth = 2;
+  for (const l of speedLines) {
+    l.y += l.v * dt;
+    if (l.y - l.len > H) { l.y = -l.len; l.x = fxRng() * W; }
+    ctx.beginPath(); ctx.moveTo(l.x, l.y); ctx.lineTo(l.x, l.y - l.len); ctx.stroke();
+  }
+  // Drones (visual only — they never touch the sim).
+  droneTimer -= dt;
+  if (droneTimer <= 0) {
+    droneTimer += 3.5;
+    const dir = fxRng() < 0.5 ? 1 : -1;
+    drones.push({ x: dir > 0 ? -60 : W + 60, y: 300 + fxRng() * 900, vx: dir * (360 + fxRng() * 120), blink: 0 });
+  }
+  for (let i = drones.length - 1; i >= 0; i--) {
+    const d = drones[i];
+    d.x += d.vx * dt; d.blink += dt;
+    if (d.x < -80 || d.x > W + 80) { drones.splice(i, 1); continue; }
+    ctx.save(); ctx.translate(d.x, d.y); ctx.scale(Math.sign(d.vx), 1);
+    ctx.fillStyle = '#ff3b5c';
+    ctx.beginPath(); ctx.moveTo(26, 0); ctx.lineTo(-20, -16); ctx.lineTo(-10, 0); ctx.lineTo(-20, 16);
+    ctx.closePath(); ctx.fill();
+    if (Math.sin(d.blink * 10) > 0) { ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(0, 0, 4, 0, Math.PI * 2); ctx.fill(); }
+    ctx.restore();
+  }
+  // Consume sim events -> particles + shake (visual only).
+  while (eventIdx < events.length) {
+    const e = events[eventIdx++];
+    if (e.type === 'collect') { spawnBurst(e.x, e.y); shake = Math.min(7, shake + 3.5); }
+  }
+  shake = Math.max(0, shake - 26 * dt);
+  ctx.save();
+  if (shake > 0.2) ctx.translate((fxRng() - 0.5) * shake, (fxRng() - 0.5) * shake);
+  // Stars: glowing gold with sparkle.
+  for (const s of stars) {
+    ctx.save();
+    ctx.shadowColor = '#ffd640'; ctx.shadowBlur = 18;
+    ctx.fillStyle = '#ffd640';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(s.x - 16, s.y); ctx.lineTo(s.x + 16, s.y);
+    ctx.moveTo(s.x, s.y - 16); ctx.lineTo(s.x, s.y + 16);
+    ctx.stroke();
+  }
+  // Rocks: dark asteroids with craters + warm rim.
+  for (const r of rocks) {
+    ctx.save(); ctx.translate(r.x, r.y); ctx.rotate(r.rot);
+    ctx.fillStyle = '#4a3b52';
+    ctx.beginPath();
+    ctx.moveTo(-r.s / 2, -r.s / 4); ctx.lineTo(-r.s / 5, -r.s / 2); ctx.lineTo(r.s / 3, -r.s / 2);
+    ctx.lineTo(r.s / 2, 0); ctx.lineTo(r.s / 4, r.s / 2); ctx.lineTo(-r.s / 3, r.s / 2);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#ff9a5c'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#332639';
+    ctx.beginPath(); ctx.arc(-r.s / 6, -r.s / 8, r.s / 7, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(r.s / 5, r.s / 6, r.s / 9, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  drawShipDay7(dt);
+  // Particles.
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 320 * dt;
+    ctx.fillStyle = `rgba(255,214,64,${p.life / p.maxLife})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+  // Floating +10 texts.
+  ctx.textAlign = 'center';
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i];
+    f.life -= dt; f.y -= 44 * dt;
+    if (f.life <= 0) { floaters.splice(i, 1); continue; }
+    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, f.life * 2)})`;
+    ctx.font = '700 34px "DejaVu Sans", sans-serif';
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.restore();
+  // HUD: score, combo, week progress.
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#fff';
+  ctx.font = '700 44px "DejaVu Sans", sans-serif';
+  ctx.fillText('SCORE ' + String(score).padStart(4, '0'), 48, 92);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = combo >= 5 ? '#ffd640' : '#9be8ff';
+  ctx.fillText('COMBO x' + combo, W - 48, 92);
+  // Week progress: 7 day pips, all filled on day 7.
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255,255,255,0.65)';
+  ctx.font = '700 26px "DejaVu Sans", sans-serif';
+  ctx.fillText('WEEK 1', 48, 150);
+  for (let d = 0; d < 7; d++) {
+    ctx.fillStyle = '#00e5ff';
+    ctx.beginPath(); ctx.arc(200 + d * 46, 142, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#04020f';
+    ctx.font = '700 18px "DejaVu Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(String(d + 1), 200 + d * 46, 149);
+    ctx.textAlign = 'left';
+  }
+  // Bottom progress bar.
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.fillRect(48, H - 60, W - 96, 10);
+  ctx.fillStyle = '#00e5ff';
+  ctx.fillRect(48, H - 60, (W - 96) * Math.min(1, simT / 20), 10);
+}
+
+// ---- main loop: fixed 1/60 s sim steps, wall-clock driven ----
+let last = performance.now();
+let acc = 0;
+const STEP = 1 / 60;
+window.__ready = true;
+window.__sim = { get t() { return simT; }, get score() { return score; }, get combo() { return combo; } };
+
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.25) dt = 0.25; // clamp tab-switch jumps
+  acc += dt;
+  let n = 0;
+  while (acc >= STEP && n < 5) { stepSim(STEP); acc -= STEP; n++; }
+  if (DAY7) renderDay7(dt); else renderDay1();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
